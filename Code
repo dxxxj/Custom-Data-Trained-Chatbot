@@ -1,0 +1,192 @@
+import torchvision.transforms as transforms
+from PIL import Image 
+from gpt_index import SimpleDirectoryReader, GPTSimpleVectorIndex, PromptHelper,LLMPredictor
+from langchain.llms import OpenAI
+import gradio as gr
+import os
+import pytesseract
+import speech_recognition as sr 
+import numpy as np
+import openai
+ 
+os.environ ["OPENAI_API_KEY"]= "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"
+model_id = 'whisper-1'
+
+media_file_path = r"C:\Users\divij\OneDrive\Desktop\docs\sample-0.mp3"
+media_file = open(media_file_path, 'rb')
+response = openai.Audio.transcribe(
+    api_key="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",
+    model=model_id,
+    file=media_file
+)
+print (response['text'])
+
+conversation_history = []
+response_variations = [
+    "Sure {name} , here's what I found:",
+    "Here's the information you requested {name} :",
+    "I've got an answer for you {name} :",
+    "This is what I found {name} :",
+    "Here's the response {name} :"
+]
+
+import random    
+
+def construct_index(directory_path):
+    max_input_size = 4096
+    num_outputs = 512
+    max_chunk_overlap = 20
+    chunk_size_limit = 600   
+    prompt_helper = PromptHelper(max_input_size, num_outputs, max_chunk_overlap, chunk_size_limit = chunk_size_limit)
+
+    llm_predictor = LLMPredictor(llm=OpenAI(temperature=1.5, model_name="gpt-3.5-turbo", max_tokens=num_outputs))
+    documents = SimpleDirectoryReader(directory_path).load_data()
+    
+    index =GPTSimpleVectorIndex(documents, llm_predictor=llm_predictor, prompt_helper=prompt_helper)
+
+    index.save_to_disk('index.json')
+
+    return index
+
+def generate_description_for_image(image_tensor):
+    input_prompt = "Describe the content of the uploaded image."
+    response = generate_response_from_text(input_prompt, index)
+    return response
+
+def preprocess_image(image_data):
+    try:
+        transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+        image = Image.fromarray(image_data).convert('RGB')
+        ocr_text = pytesseract.image_to_string(image, lang='eng')
+        print("OCR Text:", ocr_text)
+
+        image_tensor = transform(image).unsqueeze(0)
+        
+        image_description = generate_description_for_image(image_tensor)
+
+        
+        return image_tensor, ocr_text, image_description
+
+    except FileNotFoundError:
+        print("Image file not found.")
+        return None, None
+
+    except Exception as e:
+        print(f"Error during image preprocessing: {e}")
+        return None,None
+
+def recognize_speech_from_audio(audio_data):
+   try:
+       recognizer = sr.Recognizer()
+       with sr.AudioFile(audio_data) as source:
+        audio = recognizer.record(source)
+        text = recognizer.recognize_google(audio)
+        return text
+   except sr.UnknownValueError:
+        print( "Sorry, I could not understand the audio.")
+        return None
+   except sr.RequestError as e:
+        print(f"Error with speech recognition service: {e}")
+        return None
+   except Exception as e:
+       print(f"Other error during speech recognition: {e}")
+   return None 
+
+
+def chatbot(user_identifier= None, input_text=None, input_image=None, input_audio=None):
+    global conversation_history
+    
+    try:
+        if not conversation_history:
+            conversation_history.append({"user_input": " "})
+                
+        index =GPTSimpleVectorIndex.load_from_disk('index.json') 
+       
+        if input_text is None and input_image is None and input_audio is None:
+            bot_response = random.choice(response_variations)
+
+            conversation_history[-1]["user_identifier"] = user_identifier
+            return bot_response.replace("{name}", user_identifier)
+         
+        if "user_input" not in conversation_history[-1]:
+            conversation_history[-1]["user_input"] = input_text   
+           
+        if input_image is not None:
+               print("Image input received.")
+
+               image_tensor, ocr_text, image_description = preprocess_image(input_image)
+               if image_tensor is not None:
+                  conversation_history[-1]["user_input"] = " " +ocr_text
+
+                  if ocr_text:
+                    conversation_history[-1]["user_input"] += " " + ocr_text
+                    print("Image text:", ocr_text)
+                    return ocr_text
+                
+                  if image_description:
+                    if conversation_history[-1]["user_input"]:
+                       conversation_history[-1]["user_input"] += " " + image_description
+                    else:
+                       conversation_history[-1]["user_input"] = image_description
+
+                    response = generate_response_from_text(conversation_history[-1]["user_input"], index)
+                    return response
+
+                    
+        if input_audio is not None:
+                recognized_text = recognize_speech_from_audio(input_audio)
+                if recognized_text is not None:
+                    conversation_history[-1]["input_audio"] = recognized_text
+
+                user_input = recognized_text or conversation_history[-1].get("input_audio", " ")
+                response = generate_response_from_text(user_input, index)
+                return response  
+        if input_text is not None:
+            response = generate_response_from_text(input_text, index)
+            return response
+        
+        if user_identifier:
+            bot_response = random.choice(response_variations)
+            bot_response = bot_response.replace("{name}", user_identifier)
+        else: 
+            bot_response = random.choice(response_variations)
+
+        conversation_history[-1]["bot_response"] = bot_response
+        return bot_response
+
+                           
+    except Exception  as e:
+                print(f"Unexpected error in chatbot: {e}")
+                import traceback
+                traceback.print_exc()
+                return "Sorry, an unexpected error occurred. Please try again later."
+            
+def generate_response_from_text(input_text, index):
+            response = index.query(input_text, response_mode="compact").response
+            return response
+
+def show_help():
+    help_text = """ Welcome to the Custom-trained AI Chatbot! 🤖🎉
+
+    This chatbot is powered by GPT-3.5 Turbo and can assist you with various queries.
+    To use the chatbot, simply type your question or request in the textbox, and the chatbot will respond accordingly.
+    If you need assistance or more information, type "help" in the textbox to display this help section.
+
+    Enjoy your conversation with the AI Chatbot!😊"""
+    return help_text
+           
+iface = gr.Interface(fn=chatbot,
+                     inputs=[gr.inputs.Textbox(label= "Your name"),
+                             gr.inputs.Textbox(label= "Enter your text"),
+                         gr.inputs.Image(label="Upload Image"),
+                             gr.inputs.Audio(label= "Speak your question", type='filepath')],
+                     outputs= gr.outputs.Textbox(label="Bot Response"),
+                     title="Custom-trained AI Chatbot",
+                     description = show_help()
+                     )
+index = construct_index("docs")
+iface.launch(share=True)
